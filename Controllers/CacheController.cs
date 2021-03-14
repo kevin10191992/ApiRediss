@@ -1,32 +1,43 @@
 ﻿using Microsoft.Extensions.Caching.Distributed;
-using Newtonsoft.Json.Linq;
+using StackExchange.Redis;
 using System;
-using System.Collections.Generic;
 using System.Configuration;
-using System.Linq;
-using System.Text.Json;
+using System.Text;
 using System.Threading.Tasks;
-using System.Web;
 using System.Web.Mvc;
 
 namespace ApiRediss.Controllers
 {
     public class CacheController : Controller
     {
-        private readonly IDistributedCache _cacheService;
 
-        public CacheController(IDistributedCache cacheService)
+        private readonly ConnectionMultiplexer _cacheService;
+        public readonly IDatabase _db;
+        public static readonly string ESTADO_CIFRADO = "-Cypher";
+        public CacheController()
         {
-            _cacheService = cacheService;
+            string conexion = ConfigurationManager.AppSettings["REDIS_URL"].ToString();
+            _cacheService = ConnectionMultiplexer.Connect(conexion);
+            _db = _cacheService.GetDatabase(0);//la 0 es por defecto
         }
 
 
-        public async Task<T> ConsultarCache<T>(string llave)
+        public async Task<T> ConsultarCache<T>(string llave, bool cifrado)
         {
             T res;
             try
             {
-                res = DeSerializador<T>(await _cacheService.GetAsync(llave));
+                llave = (cifrado) ? llave + ESTADO_CIFRADO : llave;
+                if (await _db.KeyExistsAsync(llave))
+                {
+                    var objetoCache = await _db.StringGetAsync(llave);
+                    res = DeSerializador<T>(objetoCache, cifrado);
+                }
+                else
+                {
+                    return default;
+                }
+
             }
             catch (Exception ex)
             {
@@ -36,17 +47,14 @@ namespace ApiRediss.Controllers
             return res;
         }
 
-        public async Task<bool> GuardarCache<T>(string llave, T Objeto)
+        public async Task<bool> GuardarCache<T>(string llave, T Objeto, bool cifrado)
         {
             bool res = false;
             try
             {
                 int minutos = int.Parse(ConfigurationManager.AppSettings["MinutosElementoEnCache"]);
-                var options = new DistributedCacheEntryOptions
-                {
-                    AbsoluteExpiration = DateTime.Now.AddMinutes(minutos)
-                };
-                await _cacheService.SetAsync(llave, Serializador(Objeto), options);
+                llave = (cifrado) ? llave += ESTADO_CIFRADO : llave;
+                await _db.StringSetAsync(llave, Serializador(Objeto, cifrado), TimeSpan.FromMinutes(minutos));
                 res = true;
             }
             catch (Exception ex)
@@ -57,14 +65,23 @@ namespace ApiRediss.Controllers
             return res;
         }
 
-        public async Task<bool> LimpiarCache<T>(string llave = "", bool BorrarTodo = false)
+        public async Task<bool> LimpiarCache(string llave = "", bool BorrarTodo = false)
         {
             bool res = false;
             try
             {
                 if (string.IsNullOrEmpty(llave) && !BorrarTodo) return false;
 
-                await _cacheService.RemoveAsync(llave);
+                if (BorrarTodo)
+                {
+                    var server = _cacheService.GetServer(_cacheService.GetEndPoints(true)[0]);
+                    await server.FlushDatabaseAsync(0);
+                }
+                else
+                {
+                    await _db.KeyDeleteAsync(llave);
+                }
+
                 res = true;
             }
             catch (Exception ex)
@@ -75,14 +92,31 @@ namespace ApiRediss.Controllers
             return res;
         }
 
-        private byte[] Serializador<T>(T Objeto)
+        private byte[] Serializador<T>(T Objeto, bool cifrado)
         {
-            return System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(Objeto);
+            byte[] datos;
+            string serializado = Newtonsoft.Json.JsonConvert.SerializeObject(Objeto);
+            if (cifrado)
+            {
+                datos = Encoding.UTF8.GetBytes(serializado);
+                datos = Encoding.UTF8.GetBytes(Convert.ToBase64String(datos));
+            }
+            else
+            {
+                datos = Encoding.UTF8.GetBytes(serializado);
+            }
+
+            return datos;
         }
 
-        private T DeSerializador<T>(byte[] cache)
+        private T DeSerializador<T>(byte[] cache, bool cifrado)
         {
-            return System.Text.Json.JsonSerializer.Deserialize<T>(cache);
+
+            if (cifrado)
+            {
+                cache = Convert.FromBase64String(Encoding.UTF8.GetString(cache));
+            }
+            return Newtonsoft.Json.JsonConvert.DeserializeObject<T>(Encoding.UTF8.GetString(cache));
         }
     }
 }
